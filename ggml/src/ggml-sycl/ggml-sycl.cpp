@@ -4622,6 +4622,18 @@ catch (sycl::exception const &exc) {
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
 }
+
+GGML_BACKEND_API void ggml_backend_sycl_set_embd_device(ggml_tensor *dst, const void *src, size_t size) try {
+    GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
+    ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+    ggml_sycl_set_device(dst_ctx->device);
+    const queue_ptr stream = dst_ctx->stream;
+    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(dst->data, src, size)));
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 GGML_BACKEND_API void * ggml_backend_sycl_device_malloc(size_t size, ggml_backend_t backend) try {
