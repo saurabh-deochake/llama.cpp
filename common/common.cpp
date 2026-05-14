@@ -1543,6 +1543,7 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
 
 void common_batch_clear(struct llama_batch & batch) {
     batch.n_tokens = 0;
+    batch.device_embd = nullptr;
 }
 
 void common_batch_add(

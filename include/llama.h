@@ -237,6 +237,7 @@ extern "C" {
 
         llama_token  *  token;
         float        *  embd;
+        const void   *  device_embd;
         llama_pos    *  pos;
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;

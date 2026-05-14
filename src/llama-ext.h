@@ -104,3 +104,12 @@ LLAMA_API float * llama_get_embeddings_pre_norm(struct llama_context * ctx);
 // mirrors:
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// mirrors:
+// LLAMA_API const void * llama_context::get_embeddings_pre_norm_device();
+LLAMA_API const void * llama_get_embeddings_pre_norm_device(struct llama_context * ctx);
+
+// Device memory management for MTP workspace (SYCL-only, returns NULL on non-SYCL builds / failures)
+LLAMA_API void * llama_alloc_device_buffer(struct llama_context * ctx, size_t size);
+LLAMA_API void   llama_free_device_buffer(struct llama_context * ctx, void * ptr);
+LLAMA_API void   llama_device_memcpy(struct llama_context * ctx, void * dst, const void * src, size_t size);

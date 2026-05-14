@@ -5,6 +5,10 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 
+#ifdef GGML_SYCL
+#include "ggml-sycl.h"
+#endif
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
@@ -91,6 +95,17 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
+
+#ifdef GGML_SYCL
+    if (ubatch->device_embd) {
+        GGML_ASSERT(n_embd == embd->ne[0]);
+
+        const int64_t n_tokens = ubatch->n_tokens;
+        size_t size = n_tokens * n_embd * ggml_element_size(embd);
+
+        ggml_backend_sycl_set_embd_device(embd, ubatch->device_embd, size);
+    }
+#endif
 }
 
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {

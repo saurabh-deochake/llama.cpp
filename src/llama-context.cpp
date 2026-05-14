@@ -11,6 +11,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#ifdef GGML_SYCL
+#include "ggml-sycl.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -888,6 +892,49 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
     }
 }
 
+const void * llama_context::get_embeddings_pre_norm_device() {
+    return embd_pre_norm_device;
+}
+
+#ifdef GGML_SYCL
+void * llama_context::alloc_device_buffer(size_t size) {
+    ggml_backend_t dev = get_device_backend();
+    if (!dev) {
+        return nullptr;
+    }
+    return ggml_backend_sycl_device_malloc(size, dev);
+}
+
+void llama_context::free_device_buffer(void * ptr) {
+    if (!ptr) {
+        return;
+    }
+    ggml_backend_t dev = get_device_backend();
+    if (dev) {
+        ggml_backend_sycl_device_free(ptr, dev);
+    }
+}
+
+void llama_context::device_memcpy(void * dst, const void * src, size_t size) {
+    ggml_backend_t dev = get_device_backend();
+    if (dev) {
+        ggml_backend_sycl_device_memcpy(dst, src, size, dev);
+    }
+}
+#endif
+
+ggml_backend_t llama_context::get_device_backend() {
+    // backend_ptrs[0] is typically the GPU backend (SYCL/CUDA) in a single-GPU config
+    // backend_ptrs[1] is the CPU fallback
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_t b = backend_ptrs[i];
+        if (b != backend_cpu) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1426,6 +1473,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
+    // store device pointer for GPU-side embd batch (MTP speculative decoding)
+    if (t_h_pre_norm && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        embd_pre_norm_device = t_h_pre_norm->data;
+    } else {
+        embd_pre_norm_device = nullptr;
+    }
+
     // TODO: hacky solution
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
@@ -1873,6 +1927,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_outputs*n_embd*sizeof(float));
         }
 
+        // store device pointer for GPU-side embd batch (MTP speculative decoding)
+        if (t_h_pre_norm && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            embd_pre_norm_device = t_h_pre_norm->data;
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2010,6 +2069,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_pre_norm.data = nullptr;
+            embd_pre_norm_device = nullptr;
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2040,6 +2100,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_pre_norm = has_embd_pre_norm ? buffer_view<float>{(float *) (base + offset), embd_pre_norm.size} : buffer_view<float>{nullptr, 0};
     offset += embd_pre_norm.size * sizeof(float);
+
+    embd_pre_norm_device = nullptr;
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -3523,10 +3585,39 @@ float * llama_get_embeddings_pre_norm(llama_context * ctx) {
     return ctx->get_embeddings_pre_norm();
 }
 
-float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
+  float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_pre_norm_ith(i);
+}
+
+const void * llama_get_embeddings_pre_norm_device(llama_context * ctx) {
+    return ctx->get_embeddings_pre_norm_device();
+}
+
+void * llama_alloc_device_buffer(llama_context * ctx, size_t size) {
+#ifdef GGML_SYCL
+    return ctx->alloc_device_buffer(size);
+#else
+    (void)ctx; (void)size;
+    return nullptr;
+#endif
+}
+
+void llama_free_device_buffer(llama_context * ctx, void * ptr) {
+#ifdef GGML_SYCL
+    ctx->free_device_buffer(ptr);
+#else
+    (void)ctx; (void)ptr;
+#endif
+}
+
+void llama_device_memcpy(llama_context * ctx, void * dst, const void * src, size_t size) {
+#ifdef GGML_SYCL
+    ctx->device_memcpy(dst, src, size);
+#else
+    (void)ctx; (void)dst; (void)src; (void)size;
+#endif
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

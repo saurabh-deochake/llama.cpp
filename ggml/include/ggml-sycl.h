@@ -38,6 +38,14 @@ GGML_BACKEND_API void ggml_backend_sycl_get_device_description(int device,
 GGML_BACKEND_API int  ggml_backend_sycl_get_device_count();
 GGML_BACKEND_API void ggml_backend_sycl_get_device_memory(int device, size_t *free, size_t *total);
 
+// Device-to-device memcpy for embedding batch (bypasses CPU round-trip)
+GGML_BACKEND_API void ggml_backend_sycl_set_embd_device(ggml_tensor *dst, const void *src, size_t size);
+
+// SYCL USM device memory helpers (for MTP workspaces)
+GGML_BACKEND_API void * ggml_backend_sycl_device_malloc(size_t size, ggml_backend_t backend);
+GGML_BACKEND_API void   ggml_backend_sycl_device_free(void * ptr, ggml_backend_t backend);
+GGML_BACKEND_API void   ggml_backend_sycl_device_memcpy(void * dst, const void * src, size_t size, ggml_backend_t backend);
+
 // SYCL doesn't support registering host memory, keep here for reference
 // GGML_BACKEND_API bool ggml_backend_sycl_register_host_buffer(void * buffer, size_t size);
 // GGML_BACKEND_API void ggml_backend_sycl_unregister_host_buffer(void * buffer);

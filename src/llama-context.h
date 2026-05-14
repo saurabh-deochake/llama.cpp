@@ -87,6 +87,11 @@ struct llama_context {
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
 
+    const void * get_embeddings_pre_norm_device();
+
+    // Returns the first non-CPU backend (GPU backend for SYCL/CUDA ops)
+    ggml_backend_t get_device_backend();
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -286,6 +291,18 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+
+    // device pointer for embd_pre_norm (for GPU-side embd batch, SYCL-only)
+    const void * embd_pre_norm_device = nullptr;
+
+#ifdef GGML_SYCL
+public:
+    // allocate/free SYCL USM device memory for MTP workspace buffers
+    void * alloc_device_buffer(size_t size);
+    void   free_device_buffer(void * ptr);
+    void   device_memcpy(void * dst, const void * src, size_t size);
+private:
+#endif
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

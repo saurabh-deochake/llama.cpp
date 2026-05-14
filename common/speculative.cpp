@@ -383,6 +383,11 @@ struct common_speculative_state_mtp : public common_speculative_impl {
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
+#ifdef GGML_SYCL
+    void * embd_draft_dev = nullptr;       // GPU workspace for embd batch in process()
+    size_t embd_draft_dev_cap = 0;         // capacity (bytes)
+#endif
+
     common_speculative_state_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_MTP, n_seq)
         , params(params.draft)
@@ -423,6 +428,13 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+#ifdef GGML_SYCL
+        if (embd_draft_dev) {
+            llama_free_device_buffer(params.ctx_tgt, embd_draft_dev);
+            embd_draft_dev = nullptr;
+            embd_draft_dev_cap = 0;
+        }
+#endif
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -486,6 +498,46 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
         //                                                       ^--- this is a problem
         // TODO:this is generally true, but would be nice to assert it
+        bool use_device_embd = false;
+#ifdef GGML_SYCL
+        {
+            const void * dev_h_tgt = llama_get_embeddings_pre_norm_device(ctx_tgt);
+            if (dev_h_tgt != nullptr) {
+                // Allocate or grow workspace buffer
+                const size_t needed = (size_t)n_tokens * n_embd * sizeof(float);
+                if (!embd_draft_dev || embd_draft_dev_cap < needed) {
+                    if (embd_draft_dev) {
+                        llama_free_device_buffer(ctx_tgt, embd_draft_dev);
+                    }
+                    embd_draft_dev = llama_alloc_device_buffer(ctx_tgt, needed);
+                    embd_draft_dev_cap = embd_draft_dev ? needed : 0;
+                }
+                if (embd_draft_dev) {
+                    // D2D: shift dev_h_tgt right by 1 — copy rows 0..n_tokens-2 → rows 1..n_tokens-1
+                    const size_t shift_dst = 1 * n_embd * sizeof(float);
+                    const size_t shift_sz  = (size_t)(n_tokens - 1) * n_embd * sizeof(float);
+                    llama_device_memcpy(ctx_tgt,
+                        (char *)embd_draft_dev + shift_dst,
+                        dev_h_tgt,
+                        shift_sz);
+
+                    // CPU→GPU: copy pending_h rows for each sequence start position
+                    for (llama_seq_id sid = 0; sid < (llama_seq_id) n_seq; ++sid) {
+                        if (i_batch_beg[sid] < 0) continue;
+                        const size_t dst_off = i_batch_beg[sid] * n_embd * sizeof(float);
+                        llama_device_memcpy(ctx_tgt,
+                            (char *)embd_draft_dev + dst_off,
+                            pending_h[sid].data(),
+                            row_bytes);
+                    }
+
+                    batch.device_embd = embd_draft_dev;
+                    use_device_embd = true;
+                }
+            }
+        }
+        if (!use_device_embd)
+#endif
         {
             const float * h_tgt = llama_get_embeddings_pre_norm(ctx_tgt);
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
@@ -510,7 +562,9 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 continue;
             }
 
-            set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+            if (!use_device_embd) {
+                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+            }
         }
 
         const int32_t rc = llama_decode(ctx_dft, batch);
@@ -524,8 +578,24 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 continue;
             }
 
-            const float * h_last = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
-            std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+#ifdef GGML_SYCL
+            if (use_device_embd) {
+                // Device pointer capture — avoid CPU sync from llama_get_embeddings_pre_norm_ith
+                const void * dev_base = llama_get_embeddings_pre_norm_device(ctx_tgt);
+                if (dev_base) {
+                    const void * dev_row = (const char *)dev_base + i_batch_end[seq_id] * n_embd * sizeof(float);
+                    // Async copy GPU→CPU to fill pending_h for the next iteration
+                    llama_device_memcpy(ctx_tgt,
+                        pending_h[seq_id].data(),
+                        dev_row,
+                        row_bytes);
+                }
+            } else
+#endif
+            {
+                const float * h_last = llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_end[seq_id]);
+                std::memcpy(pending_h[seq_id].data(), h_last, row_bytes);
+            }
         }
 
         return true;
@@ -543,6 +613,22 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // SYCL: track whether we're using device_embd path
+        bool draft_use_device = false;
+#ifdef GGML_SYCL
+        // ensure workspace is large enough for all sequences
+        size_t draft_needed = (size_t)n_seq * n_embd * sizeof(float);
+        if (!embd_draft_dev || embd_draft_dev_cap < draft_needed) {
+            if (embd_draft_dev) {
+                llama_free_device_buffer(params.ctx_tgt, embd_draft_dev);
+            }
+            embd_draft_dev = llama_alloc_device_buffer(params.ctx_tgt, draft_needed);
+            embd_draft_dev_cap = embd_draft_dev ? draft_needed : 0;
+        }
+        const void * dev_dft_base = llama_get_embeddings_pre_norm_device(ctx_dft);
+        bool can_use_device = (embd_draft_dev != nullptr) && (dev_dft_base != nullptr);
+#endif
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -556,9 +642,28 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
 
-            h_row = pending_h[seq_id].data();
-            std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+#ifdef GGML_SYCL
+            if (can_use_device) {
+                // Upload pending_h row to workspace buffer at the correct position
+                const size_t dst_off = (batch.n_tokens - 1) * n_embd * sizeof(float);
+                llama_device_memcpy(params.ctx_tgt,
+                    (char *)embd_draft_dev + dst_off,
+                    pending_h[seq_id].data(),
+                    row_bytes);
+            } else
+#endif
+            {
+                h_row = pending_h[seq_id].data();
+                std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+            }
         }
+
+#ifdef GGML_SYCL
+        if (can_use_device) {
+            batch.device_embd = embd_draft_dev;
+            draft_use_device = true;
+        }
+#endif
 
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
@@ -581,7 +686,20 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+#ifdef GGML_SYCL
+                // Save device pointer for this batch position (used after token is accepted)
+                const void * dev_row = nullptr;
+                if (draft_use_device) {
+                    const void * dev_base = llama_get_embeddings_pre_norm_device(ctx_dft);
+                    if (dev_base) {
+                        dev_row = (const char *)dev_base + (size_t)i_batch * n_embd * sizeof(float);
+                    }
+                }
+                if (!dev_row)
+#endif
+                {
+                    h_row = llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch);
+                }
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -618,12 +736,31 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 }
 
                 common_batch_add(batch, id, dp.n_past + i + 1, { seq_id }, true);
-                std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+#ifdef GGML_SYCL
+                if (dev_row) {
+                    // Copy embedding from ctx_dft's device output to workspace buffer
+                    const size_t dst_off = (batch.n_tokens - 1) * n_embd * sizeof(float);
+                    llama_device_memcpy(params.ctx_tgt,
+                        (char *)embd_draft_dev + dst_off,
+                        dev_row,
+                        row_bytes);
+                } else
+#endif
+                {
+                    std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+                }
             }
 
             if (batch.n_tokens == 0) {
                 break;
             }
+
+            // Set device_embd for the decode
+#ifdef GGML_SYCL
+            if (draft_use_device) {
+                batch.device_embd = embd_draft_dev;
+            }
+#endif
 
             // evaluate the drafted tokens on the draft model
             ret = llama_decode(ctx_dft, batch);
@@ -632,17 +769,7 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 break;
             }
 
-            ++i;
-        }
-
-        for (auto & dp : dparams) {
-            if (!dp.drafting) {
-                continue;
-            }
-
-            if (dp.result->size() < (size_t) params.n_min) {
-                dp.result->clear();
-            }
+            i++;
         }
     }
 
