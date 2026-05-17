@@ -386,6 +386,9 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 #ifdef GGML_SYCL
     void * embd_draft_dev = nullptr;       // GPU workspace for embd batch in process()
     size_t embd_draft_dev_cap = 0;         // capacity (bytes)
+    void * pending_h_dev = nullptr;        // GPU carryover rows [n_seq, n_embd]
+    size_t pending_h_dev_cap = 0;          // capacity (bytes)
+    bool pending_h_dev_ready = false;
 #endif
 
     common_speculative_state_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -434,8 +437,48 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             embd_draft_dev = nullptr;
             embd_draft_dev_cap = 0;
         }
+        if (pending_h_dev) {
+            llama_free_device_buffer(params.ctx_tgt, pending_h_dev);
+            pending_h_dev = nullptr;
+            pending_h_dev_cap = 0;
+            pending_h_dev_ready = false;
+        }
 #endif
     }
+
+#ifdef GGML_SYCL
+    bool ensure_pending_h_device(llama_context * ctx) {
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const size_t needed = (size_t) n_seq * row_bytes;
+
+        if (!pending_h_dev || pending_h_dev_cap < needed) {
+            void * new_buf = llama_alloc_device_buffer(ctx, needed);
+            if (!new_buf) {
+                return false;
+            }
+
+            if (pending_h_dev) {
+                llama_free_device_buffer(ctx, pending_h_dev);
+            }
+
+            pending_h_dev = new_buf;
+            pending_h_dev_cap = needed;
+            pending_h_dev_ready = false;
+        }
+
+        if (!pending_h_dev_ready) {
+            for (llama_seq_id sid = 0; sid < (llama_seq_id) n_seq; ++sid) {
+                llama_device_memcpy(ctx,
+                    (char *) pending_h_dev + (size_t) sid * row_bytes,
+                    pending_h[sid].data(),
+                    row_bytes);
+            }
+            pending_h_dev_ready = true;
+        }
+
+        return true;
+    }
+#endif
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
@@ -512,7 +555,7 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                     embd_draft_dev = llama_alloc_device_buffer(ctx_tgt, needed);
                     embd_draft_dev_cap = embd_draft_dev ? needed : 0;
                 }
-                if (embd_draft_dev) {
+                if (embd_draft_dev && ensure_pending_h_device(ctx_tgt)) {
                     // D2D: shift dev_h_tgt right by 1 — copy rows 0..n_tokens-2 → rows 1..n_tokens-1
                     const size_t shift_dst = 1 * n_embd * sizeof(float);
                     const size_t shift_sz  = (size_t)(n_tokens - 1) * n_embd * sizeof(float);
@@ -521,13 +564,14 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                         dev_h_tgt,
                         shift_sz);
 
-                    // CPU→GPU: copy pending_h rows for each sequence start position
+                    // D2D: copy carryover rows for each sequence start position
                     for (llama_seq_id sid = 0; sid < (llama_seq_id) n_seq; ++sid) {
                         if (i_batch_beg[sid] < 0) continue;
                         const size_t dst_off = i_batch_beg[sid] * n_embd * sizeof(float);
+                        const size_t src_off = (size_t) sid * n_embd * sizeof(float);
                         llama_device_memcpy(ctx_tgt,
                             (char *)embd_draft_dev + dst_off,
-                            pending_h[sid].data(),
+                            (const char *)pending_h_dev + src_off,
                             row_bytes);
                     }
 
@@ -584,9 +628,9 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 const void * dev_base = llama_get_embeddings_pre_norm_device(ctx_tgt);
                 if (dev_base) {
                     const void * dev_row = (const char *)dev_base + i_batch_end[seq_id] * n_embd * sizeof(float);
-                    // Async copy GPU→CPU to fill pending_h for the next iteration
+                    const size_t dst_off = (size_t) seq_id * n_embd * sizeof(float);
                     llama_device_memcpy(ctx_tgt,
-                        pending_h[seq_id].data(),
+                        (char *)pending_h_dev + dst_off,
                         dev_row,
                         row_bytes);
                 }
@@ -613,8 +657,8 @@ struct common_speculative_state_mtp : public common_speculative_impl {
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
-        // SYCL: track whether we're using device_embd path
-        bool draft_use_device = false;
+        // SYCL: track whether we can feed draft embeddings from device memory.
+        bool can_use_device = false;
 #ifdef GGML_SYCL
         // ensure workspace is large enough for all sequences
         size_t draft_needed = (size_t)n_seq * n_embd * sizeof(float);
@@ -625,8 +669,7 @@ struct common_speculative_state_mtp : public common_speculative_impl {
             embd_draft_dev = llama_alloc_device_buffer(params.ctx_tgt, draft_needed);
             embd_draft_dev_cap = embd_draft_dev ? draft_needed : 0;
         }
-        const void * dev_dft_base = llama_get_embeddings_pre_norm_device(ctx_dft);
-        bool can_use_device = (embd_draft_dev != nullptr) && (dev_dft_base != nullptr);
+        can_use_device = (embd_draft_dev != nullptr) && ensure_pending_h_device(params.ctx_tgt);
 #endif
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -644,11 +687,12 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 
 #ifdef GGML_SYCL
             if (can_use_device) {
-                // Upload pending_h row to workspace buffer at the correct position
+                // Copy the carryover row from device memory to the workspace.
                 const size_t dst_off = (batch.n_tokens - 1) * n_embd * sizeof(float);
+                const size_t src_off = (size_t) seq_id * n_embd * sizeof(float);
                 llama_device_memcpy(params.ctx_tgt,
                     (char *)embd_draft_dev + dst_off,
-                    pending_h[seq_id].data(),
+                    (const char *)pending_h_dev + src_off,
                     row_bytes);
             } else
 #endif
@@ -661,7 +705,6 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 #ifdef GGML_SYCL
         if (can_use_device) {
             batch.device_embd = embd_draft_dev;
-            draft_use_device = true;
         }
 #endif
 
@@ -678,6 +721,11 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 
             common_batch_clear(batch);
 
+#ifdef GGML_SYCL
+            const void * dev_base_loop = can_use_device ? llama_get_embeddings_pre_norm_device(ctx_dft) : nullptr;
+            const bool loop_use_device = dev_base_loop != nullptr;
+#endif
+
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
                     continue;
@@ -689,11 +737,8 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 #ifdef GGML_SYCL
                 // Save device pointer for this batch position (used after token is accepted)
                 const void * dev_row = nullptr;
-                if (draft_use_device) {
-                    const void * dev_base = llama_get_embeddings_pre_norm_device(ctx_dft);
-                    if (dev_base) {
-                        dev_row = (const char *)dev_base + (size_t)i_batch * n_embd * sizeof(float);
-                    }
+                if (loop_use_device) {
+                    dev_row = (const char *)dev_base_loop + (size_t)i_batch * n_embd * sizeof(float);
                 }
                 if (!dev_row)
 #endif
@@ -757,7 +802,7 @@ struct common_speculative_state_mtp : public common_speculative_impl {
 
             // Set device_embd for the decode
 #ifdef GGML_SYCL
-            if (draft_use_device) {
+            if (loop_use_device) {
                 batch.device_embd = embd_draft_dev;
             }
 #endif
