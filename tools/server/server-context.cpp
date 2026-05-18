@@ -2924,6 +2924,7 @@ private:
                 n_tokens,
                 batch.token    + i,
                 nullptr,
+                nullptr,
                 batch.pos      + i,
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
