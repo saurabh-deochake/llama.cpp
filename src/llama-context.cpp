@@ -1468,9 +1468,14 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd;
-        GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
-        ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
+#ifdef GGML_SYCL
+        if (!ggml_backend_is_sycl(backend_h))
+#endif
+        {
+            const uint32_t n_embd = hparams.n_embd;
+            GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
+            ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
+        }
     }
 
     // store device pointer for GPU-side embd batch (MTP speculative decoding)
@@ -1919,12 +1924,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
             GGML_ASSERT(backend_h != nullptr);
 
-            const uint32_t n_embd = hparams.n_embd;
-            float * embd_pre_norm_out = embd_pre_norm.data + n_outputs_prev*n_embd;
+#ifdef GGML_SYCL
+            if (!ggml_backend_is_sycl(backend_h))
+#endif
+            {
+                const uint32_t n_embd = hparams.n_embd;
+                float * embd_pre_norm_out = embd_pre_norm.data + n_outputs_prev*n_embd;
 
-            GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_pre_norm.size);
-            ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_outputs*n_embd*sizeof(float));
+                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_pre_norm.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_outputs*n_embd*sizeof(float));
+            }
         }
 
         // store device pointer for GPU-side embd batch (MTP speculative decoding)
