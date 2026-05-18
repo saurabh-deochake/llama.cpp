@@ -235,6 +235,11 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
     cb(cur, "h_pre_norm", -1);
     res->t_h_pre_norm = cur;
 
+    if (n_outputs == 0) {
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
+
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
             ? layer.nextn.shared_head_norm
             : model.output_norm;
