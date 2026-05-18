@@ -182,6 +182,14 @@ struct server_slot {
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    int64_t t_spec_ckpt_save_tgt_us = 0;
+    int64_t t_spec_ckpt_load_tgt_us = 0;
+    int64_t t_spec_ckpt_save_dft_us = 0;
+    int64_t t_spec_ckpt_load_dft_us = 0;
+    size_t  n_spec_ckpt_save_tgt = 0;
+    size_t  n_spec_ckpt_load_tgt = 0;
+    size_t  n_spec_ckpt_save_dft = 0;
+    size_t  n_spec_ckpt_load_dft = 0;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -208,6 +216,14 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+        t_spec_ckpt_save_tgt_us = 0;
+        t_spec_ckpt_load_tgt_us = 0;
+        t_spec_ckpt_save_dft_us = 0;
+        t_spec_ckpt_load_dft_us = 0;
+        n_spec_ckpt_save_tgt = 0;
+        n_spec_ckpt_load_tgt = 0;
+        n_spec_ckpt_save_dft = 0;
+        n_spec_ckpt_load_dft = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -455,6 +471,13 @@ struct server_slot {
             SLT_CNT(*this,
                     "draft acceptance rate = %0.5f (%5d accepted / %5d generated)\n",
                     draft_ratio, n_draft_accepted, n_draft_total
+            );
+            SLT_CNT(*this,
+                    "speculative checkpoint time = tgt save %.3f ms/%zu, tgt load %.3f ms/%zu, dft save %.3f ms/%zu, dft load %.3f ms/%zu\n",
+                    t_spec_ckpt_save_tgt_us / 1000.0, n_spec_ckpt_save_tgt,
+                    t_spec_ckpt_load_tgt_us / 1000.0, n_spec_ckpt_load_tgt,
+                    t_spec_ckpt_save_dft_us / 1000.0, n_spec_ckpt_save_dft,
+                    t_spec_ckpt_load_dft_us / 1000.0, n_spec_ckpt_load_dft
             );
         }
 
@@ -2294,7 +2317,10 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            const int64_t t_start = ggml_time_us();
                             slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            slot.t_spec_ckpt_save_dft_us += ggml_time_us() - t_start;
+                            slot.n_spec_ckpt_save_dft++;
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -2330,7 +2356,10 @@ private:
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             if (ctx_dft) {
+                const int64_t t_start = ggml_time_us();
                 ckpt.load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                slot.t_spec_ckpt_load_dft_us += ggml_time_us() - t_start;
+                slot.n_spec_ckpt_load_dft++;
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, ckpt.pos_max + 1, -1);
             }
@@ -2339,12 +2368,10 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
-
+                    const int64_t t_start = ggml_time_us();
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                    slot.t_spec_ckpt_save_tgt_us += ggml_time_us() - t_start;
+                    slot.n_spec_ckpt_save_tgt++;
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -3192,13 +3219,19 @@ private:
                             SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                             {
+                                const int64_t t_start = ggml_time_us();
                                 ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                slot.t_spec_ckpt_load_tgt_us += ggml_time_us() - t_start;
+                                slot.n_spec_ckpt_load_tgt++;
 
                                 llama_memory_seq_rm(llama_get_memory(slot.ctx_tgt), slot.id, ckpt.pos_max + 1, -1);
                             }
 
                             if (slot.ctx_dft) {
+                                const int64_t t_start = ggml_time_us();
                                 ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                slot.t_spec_ckpt_load_dft_us += ggml_time_us() - t_start;
+                                slot.n_spec_ckpt_load_dft++;
 
                                 llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, ckpt.pos_max + 1, -1);
                             }
