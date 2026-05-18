@@ -287,8 +287,12 @@ struct common_speculative_state_draft : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+                const int n_min = dp.n_max > 0 ? std::min(params.n_min, dp.n_max) : params.n_min;
+
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < params.p_min && (int) result.size() >= n_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -296,9 +300,6 @@ struct common_speculative_state_draft : public common_speculative_impl {
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 
@@ -758,8 +759,12 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+                const int n_min = dp.n_max > 0 ? std::min(params.n_min, dp.n_max) : params.n_min;
+
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (cur_p->data[0].p < params.p_min && (int) result.size() >= n_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -767,9 +772,6 @@ struct common_speculative_state_mtp : public common_speculative_impl {
                 }
 
                 common_sampler_accept(smpl, id, true);
-
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
 
                 result.push_back(id);
 
